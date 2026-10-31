@@ -9,12 +9,14 @@ whose price sits inside, or within ~1-2 % of, an active, unmitigated FVG.
 
 Usage
 -----
-    python fvg_scanner.py                          # WHOLE market: A) textbook pattern, B) other FVGs,
-                                                   #   with ENTRY / SL / TP1 / TP2 + CSV export
-    python fvg_scanner.py --timeframes 15m 1h 4h --max-distance 1.5 --direction bullish
-    python fvg_scanner.py --wick-tol 0 --details 3 # strictly wickless C1, show reasoning
-    python fvg_scanner.py --mode scan              # top-5 ranking only
-    python fvg_scanner.py --mode demo --plot       # worked examples + charts
+    python fvg_scanner.py                       # whole market: A) all textbook gaps, B) top-10 near-form gaps
+    python fvg_scanner.py --timeframes 15m 1h 4h --max-distance 1.5
+    python fvg_scanner.py --explain XRPUSDT --timeframes 1h   # audit: why a coin is / is not listed
+    python fvg_scanner.py --mode demo --plot    # worked examples + charts
+
+A gap is only listed if it is SIGNIFICANT, exactly like the LuxAlgo "Auto Threshold" FVG: the middle
+candle must close beyond C1's extreme AND its body % must exceed 2x the average body %. This removes
+the micro-gaps that exist on almost every chart but are never drawn by the indicator.
 
 Requirements: Python >= 3.9. Scanner uses only the standard library and
 Binance public (no API key) endpoints. matplotlib is optional (--plot).
@@ -41,8 +43,10 @@ from __future__ import annotations
 
 import argparse
 import csv
+from collections import Counter
 import json
 import math
+import matplotlib
 import statistics
 import sys
 import threading
@@ -71,7 +75,7 @@ HTF_MAP: Dict[str, str] = {
 }
 STABLE_BASES = {
     "USDC", "FDUSD", "TUSD", "USDP", "DAI", "BUSD", "AEUR", "EUR", "USDE", "PYUSD",
-    "USD1", "XUSD", "RLUSD", "UST", "USTC", "EURI", "BFUSD", "USDS",
+    "USD1", "XUSD", "RLUSD", "EURI", "BFUSD", "USDS",
 }
 # Reference windows in UTC (not official crypto sessions - guide section 3.6).
 SESSIONS: Tuple[Tuple[int, int, str], ...] = (
@@ -118,6 +122,9 @@ class FVGConfig:
     min_tp_rr: float = 1.5            # main TP = first opposing FVG whose CE gives >= this R:R
     max_target_pct: float = 25.0      # ignore targets further than this % from entry
     major_swing: int = 10             # fractal size for the fallback 'major' swings
+    # Significance (LuxAlgo 'Auto Threshold'): C2 body% must exceed this multiple of the mean body%
+    lux_threshold_mult: float = 2.0
+    max_gap_pct: float = 12.0         # hard cap on gap width as % of price (news-spike gaps)
     # Trade plan (guide 7.4 - 7.6)
     stop_atr_buffer: float = 0.25
     min_rr: float = 2.0
@@ -426,11 +433,11 @@ def update_mitigation(fvg: FVG, candles: Sequence[Candle], cfg: FVGConfig) -> FV
         c = candles[j]
         if bull:
             pen = (fvg.upper - max(c.low, fvg.lower)) / w if c.low < fvg.upper else 0.0
-            full = c.low <= fvg.lower
+            full = c.low < fvg.lower          # LuxAlgo deletes a bullish gap when low < bottom
             beyond = (c.close < fvg.lower) if cfg.invalidation_mode == "close" else full
         else:
             pen = (min(c.high, fvg.upper) - fvg.lower) / w if c.high > fvg.lower else 0.0
-            full = c.high >= fvg.upper
+            full = c.high > fvg.upper         # LuxAlgo deletes a bearish gap when high > top
             beyond = (c.close > fvg.upper) if cfg.invalidation_mode == "close" else full
         if pen > 0 and fvg.first_touch_idx is None:
             fvg.first_touch_idx = j
@@ -549,6 +556,29 @@ def dealing_range(candles: Sequence[Candle], fvg: FVG, cfg: FVGConfig
     return hi, lo, eq, pos
 
 
+def significance(candles: Sequence[Candle], fvg: FVG, cfg: FVGConfig) -> Tuple[bool, str]:
+    """
+    LuxAlgo-style significance filter. A gap is only 'real' when
+      (1) the middle candle CLOSES beyond C1's extreme (bullish: C2 close > H1; bearish: C2 close < L1), and
+      (2) |C2 body| / open  >  2 x mean(|body| / open) of all candles up to C2.
+    Tiny gaps between ordinary candles fail (2) and are never drawn by the indicator.
+    """
+    c1, c2 = candles[fvg.c1_idx], candles[fvg.c2_idx]
+    n = fvg.c2_idx + 1
+    mean = sum(abs(c.close - c.open) / c.open for c in candles[:n]) / n
+    thr = cfg.lux_threshold_mult * mean
+    delta = (c2.close - c2.open) / c2.open
+    if fvg.side is Side.BULLISH:
+        if c2.close <= c1.high:
+            return False, "C2 did not close above C1 high"
+        ok, body = delta > thr, delta
+    else:
+        if c2.close >= c1.low:
+            return False, "C2 did not close below C1 low"
+        ok, body = -delta > thr, -delta
+    return ok, f"C2 body {body:.2%} {'>' if ok else '<='} threshold {thr:.2%} ({cfg.lux_threshold_mult:g}x average body)"
+
+
 # =============================================================================
 # TRADE PLAN
 # =============================================================================
@@ -590,7 +620,8 @@ def _select_targets(bull: bool, entry: float, risk: float, atr_val: float, candl
         opp = [z for z in opp if z.upper < entry - gap_min]
         opp.sort(key=lambda z: -z.upper)
         near, far = (lambda z: z.upper), (lambda z: z.lower)
-    opp = [z for z in opp if abs(near(z) - entry) / entry * 100 <= cfg.max_target_pct]
+    opp = [z for z in opp if abs(near(z) - entry) / entry * 100 <= cfg.max_target_pct
+           and abs(z.ce - entry) / entry * 100 <= cfg.max_target_pct]
     if opp:
         main = next((z for z in opp if abs(z.ce - entry) >= cfg.min_tp_rr * risk), opp[-1])
         label = f"next opposing {want.value.lower()} FVG {fmt_price(min(main.lower, main.upper))}-{fmt_price(max(main.lower, main.upper))}"
@@ -786,6 +817,8 @@ def assess_fvg(candles: Sequence[Candle], fvg: FVG, atr: Sequence[float],
     a.breakdown["volume"] = v
 
     # ---- 4. Downgrade warnings --------------------------------------
+    sig_ok, sig_msg = significance(candles, fvg, cfg)
+    (a.passes if sig_ok else a.warns).append(("Significant gap: " if sig_ok else "NOT significant (micro-gap): ") + sig_msg)
     gap_atr = fvg.width / atr_v
     a.metrics.update(gap_atr=gap_atr, gap_pct=fvg.width / fvg.ce * 100, c2_range_atr=c2.range / atr_v)
     if gap_atr < cfg.min_gap_atr:
@@ -1053,12 +1086,13 @@ class BinanceClient:
         rows.sort(key=lambda r: r[1], reverse=True)
         return rows[:n]
 
-    def market_universe(self, min_quote_volume: float) -> List[Tuple[str, float, Optional[float]]]:
-        """ALL tradable USDT spot pairs: (symbol, 24h quote volume, tickSize), volume-sorted."""
+    def market_universe(self, min_quote_volume: float, quote: str = "USDT"
+                        ) -> List[Tuple[str, float, Optional[float]]]:
+        """ALL tradable spot pairs of one quote asset: (symbol, 24h quote volume, tickSize), volume-sorted."""
         info = self._get("/api/v3/exchangeInfo", weight=20)
         meta: Dict[str, Optional[float]] = {}
         for sy in info.get("symbols", []):  # type: ignore[union-attr]
-            if sy.get("status") != "TRADING" or sy.get("quoteAsset") != "USDT" \
+            if sy.get("status") != "TRADING" or sy.get("quoteAsset") != quote \
                     or not sy.get("isSpotTradingAllowed", True) or sy.get("baseAsset") in STABLE_BASES:
                 continue
             tick = None
@@ -1079,13 +1113,31 @@ class BinanceClient:
         rows.sort(key=lambda r: r[1], reverse=True)
         return rows
 
-    def klines(self, symbol: str, interval: str, limit: int = 500) -> Tuple[List[Candle], float]:
-        """Closed candles only + the live price (close of the forming candle)."""
+    def klines_live(self, symbol: str, interval: str, limit: int = 500
+                    ) -> Tuple[List[Candle], float, Optional[Candle]]:
+        """Closed candles, the live price and the still-forming candle (used for mitigation)."""
         weight = 1 if limit < 100 else 2 if limit < 500 else 5
-        raw = self._get("/api/v3/klines", {"symbol": symbol, "interval": interval, "limit": limit}, weight)
+        if limit <= 1000:
+            raw = self._get("/api/v3/klines", {"symbol": symbol, "interval": interval, "limit": limit}, weight)
+        else:                                   # page backwards to build a long history
+            raw, end, remaining = [], None, limit
+            while remaining > 0:
+                n = min(1000, remaining)
+                params: Dict[str, object] = {"symbol": symbol, "interval": interval, "limit": n}
+                if end is not None:
+                    params["endTime"] = end
+                page = self._get("/api/v3/klines", params, 5)
+                if not page:
+                    break
+                raw = list(page) + raw  # type: ignore[arg-type]
+                end = int(page[0][0]) - 1  # type: ignore[index]
+                remaining -= len(page)  # type: ignore[arg-type]
+                if len(page) < n:  # type: ignore[arg-type]
+                    break
         now = int(time.time() * 1000)
         closed: List[Candle] = []
         live: Optional[float] = None
+        forming: Optional[Candle] = None
         for r in raw:  # type: ignore[union-attr]
             try:
                 c = Candle(int(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5]))
@@ -1095,31 +1147,22 @@ class BinanceClient:
                 closed.append(c)
             else:
                 live = c.close
+                forming = c
         if live is None and closed:
             live = closed[-1].close
         if live is None:
             raise ValueError(f"No data for {symbol} {interval}")
+        return closed, live, forming
+
+    def klines(self, symbol: str, interval: str, limit: int = 500) -> Tuple[List[Candle], float]:
+        """Closed candles + live price (compatibility wrapper)."""
+        closed, live, _ = self.klines_live(symbol, interval, limit)
         return closed, live
 
 
 # =============================================================================
 # SCANNER
 # =============================================================================
-
-@dataclass
-class Candidate:
-    """An active FVG close to the current price."""
-    symbol: str
-    timeframe: str
-    price: float
-    distance_pct: float
-    assessment: Assessment
-    htf: str
-    htf_bias: Bias
-    quote_volume: float
-    candles: List[Candle]
-    rank: float = 0.0
-
 
 def distance_to_zone(fvg: FVG, price: float) -> Optional[float]:
     """
@@ -1136,114 +1179,19 @@ def distance_to_zone(fvg: FVG, price: float) -> Optional[float]:
     return 0.0 if price >= fvg.lower else (fvg.lower - price) / price * 100
 
 
-def scan_symbol(client: BinanceClient, symbol: str, qvol: float, timeframes: Sequence[str],
-                cfg: FVGConfig, max_dist: float, min_score: int, direction: str,
-                limit: int) -> List[Candidate]:
-    """Best near-price FVG per timeframe for one symbol."""
-    out: List[Candidate] = []
-    htf_cache: Dict[str, Tuple[Bias, int]] = {}
-    for tf in timeframes:
-        try:
-            candles, price = client.klines(symbol, tf, limit)
-            if len(candles) < 60:
-                continue
-            htf_tf = HTF_MAP.get(tf, "1d")
-            if htf_tf not in htf_cache:
-                try:
-                    htf_c, _ = client.klines(symbol, htf_tf, 300)
-                    b, st, _ = compute_htf_bias(htf_c, cfg)
-                    htf_cache[htf_tf] = (b, st)
-                except (ConnectionError, ValueError):
-                    htf_cache[htf_tf] = (Bias.NEUTRAL, 0)
-            bias, strength = htf_cache[htf_tf]
-            best: Optional[Candidate] = None
-            for a in analyse(candles, bias, strength, cfg, price):
-                f = a.fvg
-                if not f.active or a.grade is Grade.INVALID or a.score < min_score:
-                    continue
-                if direction != "both" and f.side.value.lower() != direction:
-                    continue
-                d = distance_to_zone(f, price)
-                if d is None or d > max_dist:
-                    continue
-                cand = Candidate(symbol, tf, price, d, a, htf_tf, bias, qvol, candles)
-                cand.rank = a.score + 2.0 * (1.0 - d / max_dist) if max_dist > 0 else a.score
-                if best is None or cand.rank > best.rank:
-                    best = cand
-            if best:
-                out.append(best)
-        except (ConnectionError, ValueError, TypeError) as e:
-            print(f"  [skip] {symbol} {tf}: {e}", file=sys.stderr)
-    return out
-
-
-def run_scan(args: argparse.Namespace, cfg: FVGConfig) -> None:
-    """Scan top Binance USDT pairs and print the top-N coins at / near an FVG."""
-    client = BinanceClient()
-    print("=" * 100)
-    print(f"LIVE BINANCE FVG SCAN | timeframes {args.timeframes} | max distance {args.max_distance}% | "
-          f"direction {args.direction} | min score {args.min_score}")
-    print("=" * 100)
-    try:
-        symbols = client.top_usdt_symbols(args.universe, args.min_volume)
-    except ConnectionError as e:
-        print(f"Cannot reach Binance: {e}\nCheck your connection / VPN / region restrictions.")
-        return
-    print(f"Universe: {len(symbols)} liquid USDT pairs (24h quote volume >= {args.min_volume:,.0f}).")
-    results: List[Candidate] = []
-    with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        futs = {pool.submit(scan_symbol, client, s, qv, args.timeframes, cfg, args.max_distance,
-                            args.min_score, args.direction, args.limit): s for s, qv in symbols}
-        for i, fut in enumerate(as_completed(futs), 1):
-            try:
-                results.extend(fut.result())
-            except Exception as e:  # noqa: BLE001 - never let one symbol kill the scan
-                print(f"  [error] {futs[fut]}: {e}", file=sys.stderr)
-            if i % 20 == 0:
-                print(f"  ...scanned {i}/{len(symbols)}", file=sys.stderr)
-    # One entry per coin: its best-ranked setup.
-    best: Dict[str, Candidate] = {}
-    for c in results:
-        if c.symbol not in best or c.rank > best[c.symbol].rank:
-            best[c.symbol] = c
-    top = sorted(best.values(), key=lambda c: c.rank, reverse=True)[:args.top]
-    if not top:
-        print("\nNo coin currently satisfies all filters. Try --max-distance 2, --min-score 4, "
-              "more timeframes, or a larger --universe.")
-        return
-    print(f"\nTOP {len(top)} COINS AT / NEAR A FRESH FVG (rank = score + proximity bonus)\n")
-    hdr = f"{'#':<3}{'Symbol':<12}{'TF':<5}{'Side':<8}{'Grade':<8}{'Score':<6}{'Dist%':<7}" \
-          f"{'Price':>14}  {'Zone':<31}{'Status':<10}{'R:R':<6}{'HTF':<8}"
-    print(hdr)
-    print("-" * len(hdr))
-    for i, c in enumerate(top, 1):
-        a, f = c.assessment, c.assessment.fvg
-        zone = f"{fmt_price(f.lower)}-{fmt_price(f.upper)}"
-        print(f"{i:<3}{c.symbol:<12}{c.timeframe:<5}{f.side.value[:4]:<8}{a.grade.name:<8}{a.score:<6}"
-              f"{c.distance_pct:<7.2f}{fmt_price(c.price):>14}  {zone:<31}{f.status.value:<10}"
-              f"{(a.plan.rr if a.plan else 0):<6.2f}{c.htf_bias.value[:4]:<8}")
-    print("\nDETAILS")
-    for i, c in enumerate(top, 1):
-        print(f"\n#{i} {c.symbol} [{c.timeframe}] price {fmt_price(c.price)} "
-              f"({'INSIDE zone' if c.distance_pct == 0 else f'{c.distance_pct:.2f}% from zone'}) "
-              f"| HTF {c.htf} bias {c.htf_bias.value} | 24h vol {c.quote_volume / 1e6:,.1f}M USDT")
-        print_assessment(c.assessment)
-        if args.plot:
-            plot_fvgs(c.candles, [c.assessment], f"{c.symbol} {c.timeframe}",
-                      f"{args.out_dir}/{c.symbol}_{c.timeframe}.png", show=False)
-    print("\nNote: bullish FVGs are potential spot buy-reaction zones; bearish FVGs mark resistance. "
-          "A zone is a hypothesis, not a signal - confirm entry, stop and target before acting.")
-
-
 # =============================================================================
 # WHOLE-MARKET SCAN: (A) TEXTBOOK IMAGE PATTERN, (B) OTHER VALID FVGs
 # =============================================================================
 
-def textbook_bullish(candles: Sequence[Candle], fvg: FVG, cfg: FVGConfig) -> Tuple[bool, List[str]]:
+def textbook_bullish(candles: Sequence[Candle], fvg: FVG, cfg: FVGConfig,
+                      mode: str = "strict") -> Tuple[bool, List[str]]:
     """
-    The pattern from the reference image (bullish only):
-      C1 = green candle with (almost) no wick, C2 = strong green candle (the displacement),
-      C3 = green candle, and L3 > H1 (the gap). Returns (matches, reasons it failed).
+    Bullish textbook pattern from the reference image: C1 green, C2 strong green, C3 green,
+    and L3 > H1 (the gap).
+      mode 'strict'  : C1 must also be (almost) wickless; C2 must be a strong displacement.
+      mode 'relaxed' : "three green candles, middle one is the gap" - wicks allowed,
+                       C2 only needs a body of >= 50 % of its range.
+    Returns (matches, reasons it failed).
     """
     why: List[str] = []
     if fvg.side is not Side.BULLISH:
@@ -1251,21 +1199,24 @@ def textbook_bullish(candles: Sequence[Candle], fvg: FVG, cfg: FVGConfig) -> Tup
     c1, c2, c3 = candles[fvg.c1_idx], candles[fvg.c2_idx], candles[fvg.c3_idx]
     if not c1.is_bullish:
         why.append("C1 not green")
-    if c1.range <= 0:
-        why.append("C1 zero range")
-    else:
-        wick = (c1.high - max(c1.open, c1.close)) + (min(c1.open, c1.close) - c1.low)
-        if wick > cfg.wick_tol * c1.range:
-            why.append(f"C1 has wicks ({wick / c1.range:.0%} of range)")
+    if mode == "strict":
+        if c1.range <= 0:
+            why.append("C1 zero range")
+        else:
+            wick = (c1.high - max(c1.open, c1.close)) + (min(c1.open, c1.close) - c1.low)
+            if wick > cfg.wick_tol * c1.range:
+                why.append(f"C1 has wicks ({wick / c1.range:.0%} of range)")
     if not c2.is_bullish:
         why.append("C2 not green")
-    else:
+    elif mode == "strict":
         prev = candles[max(0, fvg.c2_idx - cfg.displacement_lookback):fvg.c2_idx]
         med = _median([c.body for c in prev]) if len(prev) >= 3 else 0.0
         if c2.body_ratio < cfg.min_body_ratio:
             why.append(f"C2 not strong (body ratio {c2.body_ratio:.0%})")
         elif med > 0 and c2.body < cfg.displacement_body_mult * med:
             why.append(f"C2 not strong (body {c2.body / med:.2f}x median)")
+    elif c2.body_ratio < 0.5:
+        why.append(f"C2 body only {c2.body_ratio:.0%} of its range")
     if not c3.is_bullish:
         why.append("C3 not green")
     return not why, why
@@ -1285,63 +1236,128 @@ class MarketHit:
     quote_volume: float
     age: int
     candles: List[Candle]
+    group: str = "B"          # A = three-green textbook form | B = other valid gap
+    pure: bool = False        # A with a (nearly) wickless C1, exactly like the reference image
+
+
+@dataclass
+class AuditRow:
+    """One row per (symbol, timeframe): proof of what was fetched and why FVGs were dropped."""
+    symbol: str
+    timeframe: str
+    status: str = "ok"
+    candles: int = 0
+    detected: int = 0
+    accepted: int = 0
+    rejected: Dict[str, int] = field(default_factory=dict)
+
+
+def decide_listing(f: FVG, candles: Sequence[Candle], price: float, atr: Sequence[float], bias: Bias,
+                   strength: int, zones: Sequence[FVG], cfg: FVGConfig, tick: Optional[float],
+                   max_dist: float, min_score: int, direction: str, max_age: int
+                   ) -> Tuple[Optional[str], str, str, Optional[Assessment], Optional[float], List[str], List[str]]:
+    """
+    The single place that decides whether an FVG is listed (used by the scan AND --explain).
+    Returns (group 'A'|'B'|None, reject_key, reject_detail, assessment, distance_pct,
+             strict_deviations, relaxed_deviations).
+      A = bullish, three green candles, middle one is the gap, significant, unmitigated, near price.
+      B = any other significant, unmitigated, valid gap near price (ranked by closeness to A).
+    """
+    age = len(candles) - 1 - f.c3_idx
+    d = distance_to_zone(f, price)
+    _, strict_why = textbook_bullish(candles, f, cfg, "strict")
+    ok_rel, rel_why = textbook_bullish(candles, f, cfg, "relaxed")
+
+    def rej(key: str, detail: str = "", a: Optional[Assessment] = None):
+        return None, key, detail, a, d, strict_why, rel_why
+
+    if not f.active:
+        return rej("already filled / invalidated", f"status {f.status.value}")
+    if age > max_age:
+        return rej("older than --max-age", f"{age} bars old")
+    if direction != "both" and f.side.value.lower() != direction:
+        return rej("excluded by --direction", f.side.value)
+    if d is None:
+        return rej("price already beyond far edge")
+    if d > max_dist:
+        return rej("farther than --max-distance", f"{d:.2f}% away")
+    sig_ok, sig_msg = significance(candles, f, cfg)
+    if not sig_ok:
+        return rej("not significant (micro-gap)", sig_msg)
+    if f.width / f.ce * 100 > cfg.max_gap_pct:
+        return rej("gap too large (news spike)", f"{f.width / f.ce * 100:.1f}% of price")
+    a = assess_fvg(candles, f, atr, bias, strength, cfg, price, tick, zones)
+    if a.grade is Grade.INVALID:
+        return rej("graded INVALID", "; ".join(a.fails), a)
+    group = "A" if ok_rel else "B"
+    if group == "B" and a.score < min_score:
+        return rej("score below --min-score", f"score {a.score}", a)
+    return group, "", "", a, d, strict_why, rel_why
 
 
 def scan_symbol_market(client: BinanceClient, symbol: str, qvol: float, tick: Optional[float],
                        timeframes: Sequence[str], cfg: FVGConfig, max_dist: float,
                        min_score_other: int, direction: str, limit: int, max_age: int
-                       ) -> List[MarketHit]:
-    """Nearest textbook FVG and nearest other valid FVG per timeframe for one symbol."""
+                       ) -> Tuple[List[MarketHit], List[AuditRow]]:
+    """Nearest FVG per group (A / B) per timeframe, plus an audit row per timeframe."""
     hits: List[MarketHit] = []
+    rows: List[AuditRow] = []
     htf_cache: Dict[str, Tuple[Bias, int, List[FVG]]] = {}
     for tf in timeframes:
-        candles, price = client.klines(symbol, tf, limit)
+        row = AuditRow(symbol, tf)
+        rows.append(row)
+        try:
+            candles, price, forming = client.klines_live(symbol, tf, limit)
+        except (ConnectionError, ValueError, TypeError) as e:
+            row.status = f"error: {e}"
+            continue
+        row.candles = len(candles)
         if len(candles) < 40:
+            row.status = "skipped: fewer than 40 closed candles (new listing)"
             continue
         htf_tf = HTF_MAP.get(tf, "1d")
         if htf_tf not in htf_cache:
             try:
                 hc, _ = client.klines(symbol, htf_tf, 200)
                 b, st, _ = compute_htf_bias(hc, cfg)
-                hz = [update_mitigation(x, hc, cfg) for x in detect_fvgs(hc)]
-                htf_cache[htf_tf] = (b, st, hz)
-            except (ConnectionError, ValueError):
+                htf_cache[htf_tf] = (b, st, [update_mitigation(x, hc, cfg) for x in detect_fvgs(hc)])
+            except (ConnectionError, ValueError, TypeError):
                 htf_cache[htf_tf] = (Bias.NEUTRAL, 0, [])
         bias, strength, htf_zones = htf_cache[htf_tf]
         atr = atr_series(candles, cfg.atr_period)
-        best: Dict[bool, MarketHit] = {}
-        own = [update_mitigation(x, candles, cfg) for x in detect_fvgs(candles)]
+        live_view = candles + ([forming] if forming else [])   # forming candle counts for mitigation
+        own = [update_mitigation(x, live_view, cfg) for x in detect_fvgs(candles)]
         zones = own + htf_zones          # targets may come from this timeframe or the higher one
+        row.detected = len(own)
+        best: Dict[str, MarketHit] = {}
         for f in own:
-            age = len(candles) - 1 - f.c3_idx
-            if not f.active or age > max_age:
+            group, key, _detail, a, d, strict_why, rel_why = decide_listing(
+                f, candles, price, atr, bias, strength, zones, cfg, tick, max_dist, min_score_other,
+                direction, max_age)
+            if group is None:
+                row.rejected[key] = row.rejected.get(key, 0) + 1
                 continue
-            if direction != "both" and f.side.value.lower() != direction:
-                continue
-            d = distance_to_zone(f, price)
-            if d is None or d > max_dist:
-                continue
-            tb, why = textbook_bullish(candles, f, cfg)
-            a = assess_fvg(candles, f, atr, bias, strength, cfg, price, tick, zones)
-            if a.grade is Grade.INVALID or (not tb and a.score < min_score_other):
-                continue
-            hit = MarketHit(symbol, tf, price, d, a, tb, why, bias, qvol, age, candles)
-            cur = best.get(tb)
-            if cur is None or (d, age) < (cur.distance_pct, cur.age):
-                best[tb] = hit
+            row.accepted += 1
+            assert a is not None and d is not None
+            hit = MarketHit(symbol, tf, price, d, a, group == "A", rel_why, bias, qvol,
+                            len(candles) - 1 - f.c3_idx, candles, group,
+                            pure=(f.side is Side.BULLISH and not strict_why))
+            cur = best.get(group)
+            if cur is None or (d, hit.age) < (cur.distance_pct, cur.age):
+                best[group] = hit
         hits.extend(best.values())
-    return hits
+    return hits, rows
 
 
 def print_hits(title: str, hits: Sequence[MarketHit], show_dev: bool = False) -> None:
     """Table with precise entry / SL / TP1 / TP2 (main) for every hit."""
-    print(f"\n{title}  [{len(hits)} shown]")
+    print(f"\n{title}  [{len(hits)}]")
     if not hits:
         print("  none right now.")
         return
-    hdr = (f"{'#':<4}{'Symbol':<13}{'TF':<5}{'Side':<5}{'Dist%':<7}{'Price':>13}  {'Zone (low-high)':<29}"
-           f"{'ENTRY':>13}{'SL':>13}{'TP1':>13}{'TP2(main)':>13}{'TP2%':>7}  {'RR':<5}{'NetRR':<6}{'Sc':<4}"
-           f"{'Status':<10}" + ("Deviation from textbook" if show_dev else ""))
+    hdr = (f"{'#':<4}{'Symbol':<16}{'TF':<4}{'Side':<5}{'Dist%':<6}{'Vol$M':<7}{'Price':>12}  {'Zone (low-high)':<27}"
+           f"{'ENTRY':>12}{'SL':>12}{'TP1':>12}{'TP2(main)':>12}{'TP2%':>6}  {'RR':<5}{'NetRR':<6}{'Sc':<3}"
+           f"{'Status':<10}" + ("What differs from the form" if show_dev else "Pure"))
     print(hdr)
     print("-" * len(hdr))
     for i, h in enumerate(hits, 1):
@@ -1349,19 +1365,22 @@ def print_hits(title: str, hits: Sequence[MarketHit], show_dev: bool = False) ->
         assert p is not None
         zone = f"{fmt_price(f.lower)}-{fmt_price(f.upper)}"
         mk = "*" if p.entry_mode.startswith("at market") else ""
-        dev = ("; ".join(h.why_not) if f.side is Side.BULLISH else "bearish gap (mirror form)") if show_dev else ""
-        print(f"{i:<4}{h.symbol:<13}{h.timeframe:<5}{f.side.value[:4]:<5}{h.distance_pct:<7.2f}"
-              f"{fmt_price(h.price):>13}  {zone:<29}{fmt_price(p.entry) + mk:>13}{fmt_price(p.stop):>13}"
-              f"{fmt_price(p.target or 0):>13}{fmt_price(p.tp2 or 0):>13}{p.tp_pct:>6.1f}%  {p.rr:<5.2f}"
-              f"{p.net_rr:<6.2f}{a.score:<4}{f.status.value:<10}{dev}")
+        if show_dev:
+            tail = ("; ".join(h.why_not) or "none") if f.side is Side.BULLISH else "bearish (resistance)"
+        else:
+            tail = "yes (wickless C1)" if h.pure else "no (C1 has wicks)"
+        print(f"{i:<4}{h.symbol:<16}{h.timeframe:<4}{f.side.value[:4]:<5}{h.distance_pct:<6.2f}"
+              f"{h.quote_volume / 1e6:<7.1f}{fmt_price(h.price):>12}  {zone:<27}{fmt_price(p.entry) + mk:>12}"
+              f"{fmt_price(p.stop):>12}{fmt_price(p.target or 0):>12}{fmt_price(p.tp2 or 0):>12}{p.tp_pct:>5.1f}%  "
+              f"{p.rr:<5.2f}{p.net_rr:<6.2f}{a.score:<3}{f.status.value:<10}{tail}")
 
 
 def write_csv(path: str, rows: Sequence[Tuple[str, MarketHit]]) -> None:
-    """Export every hit (all groups) with full trade levels."""
+    """Export every listed hit with full trade levels."""
     cols = ["group", "symbol", "timeframe", "side", "price", "distance_pct", "zone_low", "zone_high", "ce",
             "entry", "entry_mode", "entry_aggressive", "entry_conservative", "stop_loss", "tp1", "tp2_main",
             "tp3", "tp2_pct", "rr_tp1", "rr_main_gross", "rr_main_net", "tp_basis", "tp_label", "score",
-            "grade", "status", "age_bars", "htf_bias", "volume_24h_usdt", "textbook_deviation"]
+            "grade", "status", "age_bars", "htf_bias", "volume_24h_usdt", "pure_wickless_c1", "differs_from_form"]
     with open(path, "w", newline="", encoding="utf-8") as fh:
         w = csv.writer(fh)
         w.writerow(cols)
@@ -1372,83 +1391,180 @@ def write_csv(path: str, rows: Sequence[Tuple[str, MarketHit]]) -> None:
                         f.upper, f.ce, p.entry, p.entry_mode, p.entry_aggressive, p.entry_conservative, p.stop,
                         p.target, p.tp2, p.tp3, round(p.tp_pct, 2), round(p.rr1, 3), round(p.rr, 3),
                         round(p.net_rr, 3), p.tp_basis, p.tp_label, a.score, a.grade.name, f.status.value,
-                        h.age, h.htf_bias.value, round(h.quote_volume),
-                        "" if h.textbook else ("; ".join(h.why_not) if f.side is Side.BULLISH else "bearish gap")])
+                        h.age, h.htf_bias.value, round(h.quote_volume), h.pure,
+                        "" if h.group == "A" else "; ".join(h.why_not)])
+
+
+def run_explain(args: argparse.Namespace, cfg: FVGConfig) -> None:
+    """
+    Audit mode: for given symbols, list every recent FVG and say EXACTLY why it is (or is not)
+    listed by the scan. Uses the same decision function as the scan.
+    """
+    client = BinanceClient()
+    for symbol in (x.upper() for x in args.explain):
+        for tf in args.timeframes:
+            print("=" * 110)
+            print(f"EXPLAIN {symbol} {tf} | filters: distance <= {args.max_distance}%, age <= {args.max_age} bars, "
+                  f"min score (group B) {args.min_score}, direction {args.direction}")
+            try:
+                candles, price, forming = client.klines_live(symbol, tf, args.limit)
+                hc, _ = client.klines(symbol, HTF_MAP.get(tf, "1d"), 200)
+            except (ConnectionError, ValueError) as e:
+                print(f"  cannot fetch data: {e}")
+                continue
+            bias, strength, _ = compute_htf_bias(hc, cfg)
+            atr = atr_series(candles, cfg.atr_period)
+            live_view = candles + ([forming] if forming else [])
+            own = [update_mitigation(x, live_view, cfg) for x in detect_fvgs(candles)]
+            zones = own + [update_mitigation(x, hc, cfg) for x in detect_fvgs(hc)]
+            print(f"  {len(candles)} closed candles, live price {fmt_price(price)}, HTF bias {bias.value}, "
+                  f"{len(own)} FVGs detected in the data. Newest first (max 40):")
+            for f in sorted(own, key=lambda x: -x.c3_idx)[:40]:
+                group, key, detail, asm, d, strict_why, rel_why = decide_listing(
+                    f, candles, price, atr, bias, strength, zones, cfg, None, args.max_distance,
+                    args.min_score, args.direction, args.max_age)
+                when = datetime.fromtimestamp(f.ts / 1000, tz=timezone.utc).strftime("%m-%d %H:%M")
+                verdict = f"LISTED in group {group}" if group else f"REJECTED: {key} {detail}".rstrip()
+                dist = "beyond zone" if d is None else f"{d:.2f}% away"
+                print(f"  [{when} UTC] {f.side.value[:4]} {fmt_price(f.lower)}-{fmt_price(f.upper)} "
+                      f"status={f.status.value:<11} age={len(candles) - 1 - f.c3_idx:<4} {dist:<12} -> {verdict}")
+                if f.side is Side.BULLISH:
+                    print(f"        three-green form: {'matches' if not rel_why else '; '.join(rel_why)}"
+                          f" | wickless C1: {'yes' if not strict_why else 'no'}"
+                          + (f" | score {asm.score}/10" if asm else ""))
 
 
 def run_market(args: argparse.Namespace, cfg: FVGConfig) -> None:
-    """Scan the ENTIRE Binance USDT spot market and print categories A and B."""
+    """Scan the ENTIRE spot market for one quote asset; print A, B1, B2 and a coverage report."""
     client = BinanceClient()
-    print("=" * 110)
-    print(f"WHOLE-MARKET FVG SCAN | tf {args.timeframes} | within {args.max_distance}% of zone | "
-          f"max age {args.max_age} bars | direction {args.direction}")
-    print("A = textbook image pattern: C1 green & wickless (<= "
-          f"{cfg.wick_tol:.0%} wick), C2 strong green, C3 green, L3 > H1.")
-    print("B = any other valid, unmitigated FVG with score >= "
-          f"{args.min_score}: B1 = top 10 closest to the textbook form, B2 = next 10.")
-    print("=" * 110)
+    print("=" * 112)
+    print(f"WHOLE-MARKET FVG SCAN | quote {args.quote} | tf {args.timeframes} | within {args.max_distance}% of zone"
+          f" | max age {args.max_age} bars | direction {args.direction}")
+    print("Every gap must be SIGNIFICANT (LuxAlgo auto-threshold: C2 closes beyond C1 and its body > 2x the average")
+    print("body) and UNMITIGATED (not filled / invalidated, forming candle included) to be listed at all.")
+    print("A  = the form in your image: C1 green, C2 strong green (the gap), C3 green. 'Pure' = C1 also wickless.")
+    print("B1/B2 = the 10 + 10 bullish gaps closest to that form (at most 3 differences), best first.")
+    print("=" * 112)
     try:
-        universe = client.market_universe(args.min_volume)
+        universe = client.market_universe(args.min_volume, args.quote)
     except ConnectionError as e:
         print(f"Cannot reach Binance: {e}\nCheck connection / VPN / region restrictions.")
         return
     if args.universe > 0:
         universe = universe[:args.universe]
-    print(f"Scanning {len(universe)} USDT spot pairs (24h volume >= {args.min_volume:,.0f} USDT)...")
-    hits: List[MarketHit] = []
-    failed = 0
-    with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        futs = {pool.submit(scan_symbol_market, client, s, qv, tk, args.timeframes, cfg, args.max_distance,
-                            args.min_score, args.direction, args.limit, args.max_age): s
-                for s, qv, tk in universe}
-        for i, fut in enumerate(as_completed(futs), 1):
-            try:
-                hits.extend(fut.result())
-            except Exception as e:  # noqa: BLE001
-                failed += 1
-                print(f"  [skip] {futs[fut]}: {e}", file=sys.stderr)
-            if i % 50 == 0:
-                print(f"  ...{i}/{len(universe)}", file=sys.stderr)
-    dist_key = lambda h: (h.distance_pct, -h.assessment.score, h.age)  # noqa: E731
-    cat_a = sorted((h for h in hits if h.textbook), key=dist_key)
-    others = [h for h in hits if not h.textbook]
+    meta = {sy: (qv, tk) for sy, qv, tk in universe}
+    print(f"Universe: {len(universe)} TRADING {args.quote} spot pairs (24h volume >= {args.min_volume:,.0f}).")
 
-    def deviation(h: MarketHit) -> int:
-        """How many textbook criteria the gap misses (bearish gaps are a different form: 9)."""
-        return len(h.why_not) if h.assessment.fvg.side is Side.BULLISH else 9
+    def run_pass(items: Sequence[Tuple[str, Sequence[str]]], workers: int
+                 ) -> Tuple[List[MarketHit], List[AuditRow]]:
+        out_h: List[MarketHit] = []
+        out_r: List[AuditRow] = []
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futs = {pool.submit(scan_symbol_market, client, sy, meta[sy][0], meta[sy][1], tfs, cfg,
+                                args.max_distance, args.min_score, args.direction, args.limit, args.max_age): sy
+                    for sy, tfs in items}
+            for i, fut in enumerate(as_completed(futs), 1):
+                try:
+                    h, r = fut.result()
+                    out_h.extend(h)
+                    out_r.extend(r)
+                except Exception as e:  # noqa: BLE001 - recorded, never silently dropped
+                    out_r.extend(AuditRow(futs[fut], tf, f"error: {e}") for tf in args.timeframes)
+                if i % 50 == 0:
+                    print(f"  ...{i}/{len(items)}", file=sys.stderr)
+        return out_h, out_r
 
-    # Group B1: closest to the real form (fewest deviations), then quality, then proximity.
-    b1 = sorted((h for h in others if deviation(h) < 9),
-                key=lambda h: (min(deviation(h), 3), -h.assessment.score, h.distance_pct))[:10]
-    used = {id(h) for h in b1}
-    # Group B2: next 10 best remaining valid gaps (any form / side) by quality, then proximity.
-    rest = sorted((h for h in others if id(h) not in used), key=lambda h: (-h.assessment.score, h.distance_pct))
-    b2, b_rest = rest[:10], rest[10:]
-    print_hits("A) TEXTBOOK PATTERN (green wickless C1 -> strong green C2 -> green C3)", cat_a)
-    print_hits("B1) TOP 10 CLOSEST TO THE TEXTBOOK FORM (valid, strong, fewest deviations)", b1, True)
-    print_hits("B2) NEXT 10 VALID GAPS (second tier, ranked by quality score)", b2, True)
-    print(f"\n({len(b_rest)} further valid gaps are in the CSV under group B3.)")
+    hits, rows = run_pass([(sy, args.timeframes) for sy, _, _ in universe], args.workers)
+    for attempt in (1, 2):                       # retry every failed symbol/timeframe, slowly
+        bad: Dict[str, List[str]] = {}
+        for r in rows:
+            if r.status.startswith("error"):
+                bad.setdefault(r.symbol, []).append(r.timeframe)
+        if not bad:
+            break
+        print(f"  retry {attempt}: {len(bad)} symbols had fetch errors, retrying slowly...", file=sys.stderr)
+        time.sleep(5)
+        rows = [r for r in rows if not (r.symbol in bad and r.timeframe in bad[r.symbol])]
+        h2, r2 = run_pass(list(bad.items()), 2)
+        hits.extend(h2)
+        rows.extend(r2)
+
+    # ---- grouping: unique coins, A first, then the closest-to-form bullish gaps ----------------
+    cat_a = sorted((h for h in hits if h.group == "A" and h.assessment.fvg.side is Side.BULLISH),
+                   key=lambda h: (not h.pure, h.distance_pct, -h.assessment.score))
+    seen = set()
+    cat_a_u: List[MarketHit] = []
+    for h in cat_a:                              # a coin may qualify on several timeframes: keep all rows of A
+        cat_a_u.append(h)
+        seen.add(h.symbol)
+    cand_b = sorted((h for h in hits if h.group == "B" and h.assessment.fvg.side is Side.BULLISH
+                     and len(h.why_not) <= 3 and h.symbol not in seen),
+                    key=lambda h: (len(h.why_not), -h.assessment.score, h.distance_pct))
+    b_all: List[MarketHit] = []
+    for h in cand_b:                             # one row per coin in B
+        if h.symbol not in {x.symbol for x in b_all}:
+            b_all.append(h)
+    b1, b2 = b_all[:10], b_all[10:20]
+    bears = sorted((h for h in hits if h.assessment.fvg.side is Side.BEARISH),
+                   key=lambda h: (h.distance_pct, -h.assessment.score))[:10] if args.direction != "bullish" else []
+    print_hits("A) ALL COINS MATCHING THE FORM (C1 green -> strong green C2 = the gap -> C3 green)", cat_a_u)
+    print_hits("B1) TOP 10 COINS CLOSEST TO THE FORM", b1, True)
+    print_hits("B2) NEXT 10 COINS CLOSEST TO THE FORM", b2, True)
+    if bears:
+        print_hits("C) BEARISH GAPS = RESISTANCE MAP (do not buy into; spot cannot short)", bears, True)
     print("\n* = price already past CE inside the zone: entry is AT MARKET, not a limit at CE."
           "\nENTRY = CE (50 %) limit | SL = beyond the structural low/high + ATR buffer | "
           "TP1 = near edge of the first opposing FVG | TP2 (main) = CE of the next opposing FVG that pays "
           f">= {cfg.min_tp_rr:.1f}R (TP3 = its far edge) | RR/NetRR are to TP2, net of round-trip fees."
-          "\nBullish rows = potential spot buys. Bearish rows = resistance (do not buy into; spot cannot short).")
-    if failed:
-        print(f"{failed} symbols skipped (data/network errors).")
-    rows = [("A", h) for h in cat_a] + [("B1", h) for h in b1] + [("B2", h) for h in b2] \
-        + [("B3", h) for h in b_rest]
-    if rows:
-        write_csv(args.csv, rows)
-        print(f"Full results with all levels saved to: {args.csv}")
-    for title, group in (("A", cat_a), ("B1", b1), ("B2", b2)):
+          "\nOnly the nearest qualifying gap per coin per timeframe is shown.")
+
+    # ---- coverage report: proof of what was and was not checked ----------------------
+    expected = len(universe) * len(args.timeframes)
+    ok_rows = [r for r in rows if r.status == "ok"]
+    skipped = [r for r in rows if r.status.startswith("skipped")]
+    errors = [r for r in rows if r.status.startswith("error")]
+    detected = sum(r.detected for r in ok_rows)
+    rej: Counter = Counter()
+    for r in ok_rows:
+        rej.update(r.rejected)
+    accepted = sum(r.accepted for r in ok_rows)
+    print("\n" + "=" * 112)
+    print("COVERAGE REPORT")
+    print(f"  Pairs in universe ................ {len(universe)}  x {len(args.timeframes)} timeframes = {expected} checks")
+    print(f"  Checked successfully ............. {len(ok_rows)}")
+    print(f"  Skipped (new listings, <40 bars) . {len(skipped)}")
+    print(f"  FAILED to fetch (NOT checked) .... {len(errors)}")
+    for r in errors[:20]:
+        print(f"      !! {r.symbol} {r.timeframe}: {r.status}")
+    if errors:
+        print("      -> results are INCOMPLETE for the symbols above; re-run, or use --explain SYMBOL.")
+    print(f"  FVGs detected in all candles ..... {detected}")
+    for k, v in rej.most_common():
+        print(f"      dropped: {k:<38} {v}")
+    print(f"  FVGs accepted .................... {accepted}")
+    audit = args.csv.replace(".csv", "_audit.csv")
+    with open(audit, "w", newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh)
+        w.writerow(["symbol", "timeframe", "status", "closed_candles", "fvgs_detected", "accepted", "dropped_reasons"])
+        for r in sorted(rows, key=lambda r: (r.symbol, r.timeframe)):
+            w.writerow([r.symbol, r.timeframe, r.status, r.candles, r.detected, r.accepted,
+                        "; ".join(f"{k}={v}" for k, v in r.rejected.items())])
+    print(f"  Per-symbol proof (one row per pair/timeframe): {audit}")
+    print("  Not covered by design: other quote assets (use --quote), delisted/halted pairs, "
+          "timeframes you did not request, gaps older than --max-age or farther than --max-distance.")
+    print("=" * 112)
+    out_rows = [("A", h) for h in cat_a_u] + [("B1", h) for h in b1] + [("B2", h) for h in b2] \
+        + [("C", h) for h in bears]
+    if out_rows:
+        write_csv(args.csv, out_rows)
+        print(f"Listed results with all levels saved to: {args.csv}")
+    for title, group in (("A", cat_a_u), ("B1", b1), ("B2", b2)):
         for h in group[:args.details]:
             print(f"\n--- DETAIL [{title}] {h.symbol} {h.timeframe} | HTF bias {h.htf_bias.value} | "
                   f"age {h.age} bars ---")
-            if not h.textbook and h.why_not:
-                print("    Not textbook because: " + "; ".join(h.why_not))
             print_assessment(h.assessment, "  ")
     if args.plot:
-        for h in (cat_a + b1 + b2)[:30]:
+        for h in (cat_a_u + b1 + b2)[:30]:
             plot_fvgs(h.candles, [h.assessment], f"{h.symbol} {h.timeframe}",
                       f"{args.out_dir}/{h.symbol}_{h.timeframe}.png")
 
@@ -1511,38 +1627,34 @@ def plot_fvgs(candles: Sequence[Candle], assessments: Sequence[Assessment], titl
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="FVG toolkit + Binance whole-market FVG scanner")
-    p.add_argument("--mode", choices=("market", "scan", "demo", "all"), default="market",
-                   help="market = whole market A/B lists (default); scan = top-N ranking; "
-                        "demo = examples; all = demo + market")
+    p.add_argument("--mode", choices=("market", "demo", "all"), default="market",
+                   help="market = A / B1 / B2 lists (default); demo = worked examples; all = both")
     p.add_argument("--timeframes", nargs="+", default=["1h", "4h"], choices=sorted(TIMEFRAME_MINUTES))
     p.add_argument("--max-distance", type=float, default=2.0, help="max %% distance to the zone (default 2)")
-    p.add_argument("--direction", choices=("both", "bullish", "bearish"), default="both")
-    p.add_argument("--min-score", type=int, default=None, help="min quality score for category B / scan mode")
-    p.add_argument("--max-age", type=int, default=150, help="ignore FVGs older than N bars")
-    p.add_argument("--top", type=int, default=5, help="rows for --mode scan")
+    p.add_argument("--direction", choices=("bullish", "bearish", "both"), default="bullish",
+                   help="default bullish (spot buy zones); 'both' adds a bearish resistance table")
+    p.add_argument("--min-score", type=int, default=4, help="min quality score for group B (default 4)")
+    p.add_argument("--max-age", type=int, default=250, help="ignore FVGs older than N bars (needs --limit > N)")
     p.add_argument("--universe", type=int, default=0, help="limit to top-N by volume (0 = entire market)")
-    p.add_argument("--min-volume", type=float, default=None, help="min 24h quote volume in USDT")
-    p.add_argument("--limit", type=int, default=None, help="candles per request (<=1000)")
+    p.add_argument("--min-volume", type=float, default=0.0,
+                   help="min 24h quote volume (default 0 = every tradable pair)")
+    p.add_argument("--quote", default="USDT", help="quote asset to scan: USDT, USDC, FDUSD, BTC, ...")
+    p.add_argument("--explain", nargs="+", metavar="SYMBOL",
+                   help="audit mode: show why FVGs of e.g. XRPUSDT are listed / rejected")
+    p.add_argument("--limit", type=int, default=1000,
+                   help="candles of history per symbol (up to 10000; longer history = significance average closer to TradingView)")
     p.add_argument("--workers", type=int, default=8)
     p.add_argument("--invalidation", choices=("close", "wick"), default="close")
-    p.add_argument("--wick-tol", type=float, default=0.05, help="textbook C1 wick tolerance (0 = strictly none)")
+    p.add_argument("--wick-tol", type=float, default=0.05, help="'pure' C1 wick tolerance (0 = strictly none)")
     p.add_argument("--fee-pct", type=float, default=0.10, help="fee per side in %% for net R:R")
-    p.add_argument("--details", type=int, default=0, help="print full reasoning for first N hits per category")
+    p.add_argument("--details", type=int, default=0, help="print full reasoning for first N hits per group")
     p.add_argument("--csv", default="fvg_market_scan.csv")
     p.add_argument("--plot", action="store_true", help="save PNG charts (needs matplotlib)")
     p.add_argument("--out-dir", default="fvg_charts")
     args = p.parse_args(argv)
-    if args.mode == "scan":
-        args.min_score = 5 if args.min_score is None else args.min_score
-        args.min_volume = 20_000_000 if args.min_volume is None else args.min_volume
-        args.limit = 500 if args.limit is None else args.limit
-        args.universe = args.universe or 100
-    else:
-        args.min_score = 4 if args.min_score is None else args.min_score
-        args.min_volume = 1_000_000 if args.min_volume is None else args.min_volume
-        args.limit = 300 if args.limit is None else args.limit
-    if args.max_distance < 0 or not 0 <= args.min_score <= 10 or not 50 <= args.limit <= 1000 \
-            or args.top < 1 or args.workers < 1 or not 0 <= args.wick_tol <= 0.5 or args.fee_pct < 0:
+    args.quote = args.quote.upper()
+    if args.max_distance < 0 or not 0 <= args.min_score <= 10 or not 50 <= args.limit <= 10000 \
+            or args.workers < 1 or not 0 <= args.wick_tol <= 0.5 or args.fee_pct < 0:
         p.error("invalid numeric argument")
     return args
 
@@ -1550,10 +1662,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
     cfg = FVGConfig(invalidation_mode=args.invalidation, wick_tol=args.wick_tol, fee_pct=args.fee_pct)
+    if args.explain:
+        run_explain(args, cfg)
+        return 0
     if args.mode in ("all", "demo"):
         run_demo(cfg, args.plot, args.out_dir)
-    if args.mode == "scan":
-        run_scan(args, cfg)
     if args.mode in ("all", "market"):
         run_market(args, cfg)
     return 0
