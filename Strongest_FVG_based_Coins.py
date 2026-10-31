@@ -46,7 +46,6 @@ import csv
 from collections import Counter
 import json
 import math
-import matplotlib
 import statistics
 import sys
 import threading
