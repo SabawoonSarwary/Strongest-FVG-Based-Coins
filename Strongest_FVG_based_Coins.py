@@ -1577,8 +1577,6 @@ def plot_fvgs(candles: Sequence[Candle], assessments: Sequence[Assessment], titl
     """Candlestick chart with FVG rectangles, CE lines and grade labels (matplotlib)."""
     try:
         import os
-        import matplotlib.pyplot as plt
-        from matplotlib.patches import Rectangle
     except ImportError:
         print("matplotlib not installed; skipping plot (pip install matplotlib).", file=sys.stderr)
         return
