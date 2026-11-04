@@ -3,8 +3,8 @@
 FVG Toolkit & Binance Scanner
 =============================
 Fair Value Gap (ICT / Smart Money Concepts) detection, validation, scoring,
-trade-plan construction, a hard-coded demonstration suite, optional matplotlib
-visualisation, and a live Binance spot scanner that returns the top-N coins
+trade-plan construction, a hard-coded demonstration suite, and a live Binance
+spot scanner that returns the top-N coins
 whose price sits inside, or within ~1-2 % of, an active, unmitigated FVG.
 
 Usage
@@ -12,14 +12,14 @@ Usage
     python fvg_scanner.py                       # whole market: A) all textbook gaps, B) top-10 near-form gaps
     python fvg_scanner.py --timeframes 15m 1h 4h --max-distance 1.5
     python fvg_scanner.py --explain XRPUSDT --timeframes 1h   # audit: why a coin is / is not listed
-    python fvg_scanner.py --mode demo --plot    # worked examples + charts
+    python fvg_scanner.py --mode demo            # worked examples
 
 A gap is only listed if it is SIGNIFICANT, exactly like the LuxAlgo "Auto Threshold" FVG: the middle
 candle must close beyond C1's extreme AND its body % must exceed 2x the average body %. This removes
 the micro-gaps that exist on almost every chart but are never drawn by the indicator.
 
 Requirements: Python >= 3.9. Scanner uses only the standard library and
-Binance public (no API key) endpoints. matplotlib is optional (--plot).
+Binance public (no API key) endpoints.
 
 Theory implemented (from the supplied guide + LuxAlgo reference indicator)
 -------------------------------------------------------------------------
@@ -995,7 +995,7 @@ def demo_scenarios_base() -> List[Candle]:
         (60650, 60800, 60300, 60750, 180)])
 
 
-def run_demo(cfg: FVGConfig, plot: bool, out_dir: str) -> None:
+def run_demo(cfg: FVGConfig) -> None:
     """Print a detailed explanation of every hard-coded example."""
     print("=" * 100)
     print("FVG DEMONSTRATION - hard-coded examples (constructed for learning, not real trades)")
@@ -1015,8 +1015,6 @@ def run_demo(cfg: FVGConfig, plot: bool, out_dir: str) -> None:
             print("    RESULT: no FVG detected -> INVALID (formation failure, not a quality issue).")
         for a in mine:
             print_assessment(a, "    ")
-        if plot:
-            plot_fvgs(candles, mine, title, f"{out_dir}/demo_{n:02d}.png", show=False, max_candles=40)
     print("\nChecklist reminder: completed candles only | outer wicks (not bodies) | strict inequality |"
           " exact zone | displacement + HTF context | entry, invalidation, target defined BEFORE trading.")
 
@@ -1562,64 +1560,6 @@ def run_market(args: argparse.Namespace, cfg: FVGConfig) -> None:
             print(f"\n--- DETAIL [{title}] {h.symbol} {h.timeframe} | HTF bias {h.htf_bias.value} | "
                   f"age {h.age} bars ---")
             print_assessment(h.assessment, "  ")
-    if args.plot:
-        for h in (cat_a_u + b1 + b2)[:30]:
-            plot_fvgs(h.candles, [h.assessment], f"{h.symbol} {h.timeframe}",
-                      f"{args.out_dir}/{h.symbol}_{h.timeframe}.png")
-
-
-# =============================================================================
-# OPTIONAL VISUALISATION
-# =============================================================================
-
-def plot_fvgs(candles: Sequence[Candle], assessments: Sequence[Assessment], title: str,
-              path: Optional[str] = None, show: bool = False, max_candles: int = 120) -> None:
-    """Candlestick chart with FVG rectangles, CE lines and grade labels (matplotlib)."""
-    try:
-        import os
-        import matplotlib.pyplot as plt
-        from matplotlib.patches import Rectangle
-    except ImportError:
-        print("matplotlib not installed; skipping plot (pip install matplotlib).", file=sys.stderr)
-        return
-    if not show:
-        plt.switch_backend("Agg")
-    off = max(0, len(candles) - max_candles)
-    view = candles[off:]
-    fig, ax = plt.subplots(figsize=(13, 6))
-    span = max(c.high for c in view) - min(c.low for c in view)
-    for i, c in enumerate(view):
-        col = "#089981" if c.close >= c.open else "#F23645"
-        ax.plot([i, i], [c.low, c.high], color=col, lw=1)
-        ax.add_patch(Rectangle((i - 0.3, min(c.open, c.close)), 0.6, max(c.body, span * 0.002), color=col))
-    for a in assessments:
-        f = a.fvg
-        end = f.end_idx if f.end_idx is not None else len(candles) - 1
-        if end < off:
-            continue
-        x0, x1 = max(f.c1_idx - off, 0) - 0.4, end - off + 0.4
-        col = "#2157f3" if f.side is Side.BULLISH else "#b22833"
-        ax.add_patch(Rectangle((x0, f.lower), x1 - x0, f.width, facecolor=col, alpha=0.25,
-                               edgecolor=col, ls="-" if a.grade is not Grade.INVALID else ":"))
-        ax.plot([x0, x1], [f.ce, f.ce], color=col, ls="--", lw=0.8)
-        ax.text(x0, f.upper, f" {f.side.value[:4]} FVG {a.grade.name} {a.score}/10", color=col,
-                fontsize=8, va="bottom")
-    ax.set_xlim(-1, len(view) + 1)
-    ax.set_ylim(min(c.low for c in view) - span * 0.05, max(c.high for c in view) + span * 0.08)
-    ax.set_title(title)
-    ax.set_xlabel("bars")
-    ax.set_ylabel("price")
-    ax.grid(alpha=0.2)
-    fig.tight_layout()
-    if path:
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        fig.savefig(path, dpi=110)
-        print(f"    chart saved: {path}")
-    if show:
-        plt.show()
-    plt.close(fig)
-
-
 # =============================================================================
 # MAIN
 # =============================================================================
@@ -1648,8 +1588,6 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--fee-pct", type=float, default=0.10, help="fee per side in %% for net R:R")
     p.add_argument("--details", type=int, default=0, help="print full reasoning for first N hits per group")
     p.add_argument("--csv", default="fvg_market_scan.csv")
-    p.add_argument("--plot", action="store_true", help="save PNG charts (needs matplotlib)")
-    p.add_argument("--out-dir", default="fvg_charts")
     args = p.parse_args(argv)
     args.quote = args.quote.upper()
     if args.max_distance < 0 or not 0 <= args.min_score <= 10 or not 50 <= args.limit <= 10000 \
@@ -1665,7 +1603,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         run_explain(args, cfg)
         return 0
     if args.mode in ("all", "demo"):
-        run_demo(cfg, args.plot, args.out_dir)
+        run_demo(cfg)
     if args.mode in ("all", "market"):
         run_market(args, cfg)
     return 0

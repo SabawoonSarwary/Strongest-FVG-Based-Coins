@@ -12,19 +12,12 @@ A Python toolkit for detecting and assessing Fair Value Gaps (FVGs), with a live
 - Builds indicative entry, stop-loss, and target levels.
 - Scans Binance spot pairs using public endpoints; no API key is required.
 - Exports scan results and a per-pair coverage audit to CSV.
-- Provides worked examples and optional chart output.
+- Provides worked examples.
 
 ## Requirements
 
 - Python 3.9 or later
-- `matplotlib` (the script imports it at startup; chart output uses it too)
 - Internet access to reach Binance public market-data endpoints when scanning or explaining live symbols
-
-Install the dependency:
-
-```bash
-python -m pip install matplotlib
-```
 
 ## Quick start
 
@@ -60,10 +53,9 @@ python Strongest_FVG_based_Coins.py --mode market
 python Strongest_FVG_based_Coins.py --mode all
 ```
 
-Add `--plot` to save charts. Use `--help` to see all options:
+Use `--help` to see all options:
 
 ```bash
-python Strongest_FVG_based_Coins.py --mode demo --plot
 python Strongest_FVG_based_Coins.py --help
 ```
 
@@ -104,8 +96,6 @@ Scores run from 0 to 10 and grades are research labels, not win probabilities. A
 | `--fee-pct` | `0.10` | Estimated fee per side, used for net R:R |
 | `--details` | `0` | Print full reasoning for the first N hits in each group |
 | `--csv` | `fvg_market_scan.csv` | Results CSV path; the audit file uses the `_audit.csv` suffix |
-| `--plot` | Off | Save charts for demo examples or scan hits |
-| `--out-dir` | `fvg_charts` | Directory for chart images |
 | `--explain SYMBOL ...` | — | Explain why recent gaps for one or more symbols are listed or rejected |
 
 `--explain` runs the audit view instead of the selected mode. For example, `--explain BTCUSDT ETHUSDT --timeframes 1h 4h` checks both symbols on both intervals.
@@ -116,6 +106,5 @@ A market scan prints candidate tables and a coverage report. It writes:
 
 - The results CSV to the path given by `--csv` when there are listed hits.
 - A per-symbol/timeframe audit CSV using the `_audit.csv` suffix.
-- PNG charts under `--out-dir` when `--plot` is enabled.
 
 The results CSV includes FVG bounds, entry and target levels, gross and net R:R, score, grade, mitigation status, and higher-timeframe bias. These are analytical references only; the script does not place orders.
